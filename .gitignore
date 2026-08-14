@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 环境与缓存
+.venv/
+venv/
+
+# SAM2 权重（约 148MB，超出 GitHub 单文件限制，README 提供下载方式）
+checkpoints/
+
+# 测试产物
+test_run/
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
