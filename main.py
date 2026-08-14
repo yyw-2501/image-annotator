@@ -116,6 +116,27 @@ class SamWorker:
                 raise ApiError("SAM2 分割失败: %s" % res["error"])
             return res.get("polygons") or []
 
+    def segment_points(self, image, points, labels=None):
+        """用点提示（正/负样本）做分割，返回多边形列表（通常单元素）。"""
+        with self._lock:
+            if not self._alive():
+                self.log("SAM2 子进程已退出，重新启动…")
+                self._start()
+            task = json.dumps({"image": image, "points": points,
+                               "labels": labels or [1] * len(points)})
+            try:
+                self.proc.stdin.write(task + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+            except (OSError, ValueError) as e:
+                raise ApiError("SAM2 子进程通信失败: %s" % e)
+            if not line:
+                raise ApiError("SAM2 子进程无响应（可能环境缺失 torch/sam2）")
+            res = json.loads(line)
+            if res.get("error"):
+                raise ApiError("SAM2 分割失败: %s" % res["error"])
+            return res.get("polygons") or []
+
     def close(self):
         with self._lock:
             if self.proc is not None:
@@ -731,6 +752,31 @@ class MainWindow(QMainWindow):
         self.sam_worker = SamWorker(python_path, log=self.log)
         return self.sam_worker
 
+    def _get_sam_worker(self):
+        """获取可用的 SAM2 worker；环境未配置时自动探测，不可用返回 None。"""
+        python_path = self.sam_python_edit.text().strip()
+        if not python_path or not os.path.isfile(python_path):
+            found = find_sam2_python()
+            if found:
+                python_path = found
+                self.sam_python_edit.setText(found)
+        if not python_path or not os.path.isfile(python_path):
+            return None
+        try:
+            return self._ensure_sam_worker(python_path)
+        except Exception as e:
+            self.log("SAM2 启动失败: %s" % e)
+            return None
+
+    def sam_segment_points(self, image_path, points, labels):
+        """供编辑窗口调用的点提示分割；返回 polygon 或 None；不可用时抛 ApiError。
+        该方法可能在后台线程被调用，故不弹窗，只抛异常。"""
+        worker = self._get_sam_worker()
+        if worker is None:
+            raise ApiError("未找到装有 torch+sam2 的 conda 环境，请先在主界面配置 SAM2 环境。")
+        polys = worker.segment_points(image_path, points, labels)
+        return polys[0] if polys else None
+
     def api_config(self):
         return {
             "base_url": self.base_url_edit.text().strip(),
@@ -913,7 +959,8 @@ class MainWindow(QMainWindow):
         index = 0
         if rec is not None and rec in ok_recs:
             index = ok_recs.index(rec)
-        win = AnnotationEditorWindow(self.records, index, self)
+        win = AnnotationEditorWindow(self.records, index, self,
+                                     sam_segmenter=self.sam_segment_points)
         win.show()
         win.raise_()
         win.activateWindow()

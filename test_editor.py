@@ -3,6 +3,7 @@
 删除标注 / 类别名与置信度编辑 → 验证写回记录。"""
 import os
 import sys
+import time
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
@@ -145,6 +146,70 @@ def test_editor():
     assert win.title_label.text().startswith("1/2"), "上一张导航失败"
     win.close()
     print("8. 修正窗口 OK")
+
+    # 9. 打点分割模式：收集正/负样本点 + 清除
+    rec3 = record_with([], [])
+    ed2 = AnnotationEditor()
+    ed2.resize(800, 600)
+    assert ed2.set_record(rec3), "载入空记录失败"
+    ed2.set_sam_mode(True)
+    ed2.mousePressEvent(mev(QEvent.Type.MouseButtonPress, ed2._to_view(200, 150)))
+    ed2.mousePressEvent(mev(QEvent.Type.MouseButtonPress, ed2._to_view(300, 200),
+                            button=Qt.MouseButton.RightButton, buttons=Qt.MouseButton.RightButton))
+    pts, labels = ed2.get_sam_points()
+    assert len(pts) == 2 and labels == [1, -1], "打点收集失败: %s %s" % (pts, labels)
+    ed2.clear_sam_points()
+    assert ed2.get_sam_points() == ([], []), "清除打点失败"
+    ed2.set_sam_mode(False)
+    print("9. 打点模式点收集/清除 OK ->", pts)
+
+    # 10. 新建多边形：加点 + 双击闭合 + add_shape 派生外接矩形并写回
+    ed2.set_poly_mode(True)
+    for vx, vy in [(100, 100), (300, 100), (300, 300)]:
+        ed2.mousePressEvent(mev(QEvent.Type.MouseButtonPress, ed2._to_view(vx, vy)))
+    assert len(ed2._draft_poly) == 3, "多边形草稿加点失败"
+    ed2.mouseDoubleClickEvent(mev(QEvent.Type.MouseButtonDblClick, ed2._to_view(100, 300)))
+    assert ed2._draft_poly == [], "双击后草稿应清空"
+    sh = ed2.add_shape("grape", [[100, 100], [300, 100], [300, 300], [100, 300]])
+    assert sh.has_polygon and sh.box == [100, 100, 300, 300], "add_shape 派生外接矩形失败: %s" % sh.box
+    ed2.apply_to_record()
+    assert rec3["boxes"][0]["name"] == "grape" and len(rec3["polygons"][0]) == 4, "新建标注写回失败"
+    print("10. 新建多边形 + add_shape 写回 OK ->", sh.box)
+
+    # 11. 窗口层：打点/新建模式按钮联动 + 结果处理
+    rec5 = record_with([], [])
+    win2 = AnnotationEditorWindow([rec5], 0)
+    win2.show()
+    win2.sam_btn.setChecked(True)
+    assert win2.editor._sam_mode and win2.run_sam_btn.isEnabled(), "打点模式联动失败"
+    win2.poly_btn.setChecked(True)
+    assert win2.editor._poly_mode and not win2.editor._sam_mode, "新建多边形模式联动失败"
+    win2.on_sam_result(("ok", [[150, 150], [250, 150], [250, 250], [150, 250]]))
+    assert len(win2.editor.shapes) == 1, "SAM 结果未新增标注"
+    win2.on_polygon_created([[50, 50], [150, 50], [150, 150], [50, 150]])
+    assert len(win2.editor.shapes) == 2, "新建多边形未新增标注"
+    win2.close()
+    print("11. 窗口层打点/新建多边形 OK")
+
+    # 12. 完整异步打点分割流程（mock SAM 回调）
+    def fake_sam(image_path, points, labels):
+        return [[160, 160], [240, 160], [240, 240], [160, 240]]
+
+    rec4 = record_with([], [])
+    win3 = AnnotationEditorWindow([rec4], 0, sam_segmenter=fake_sam)
+    win3.show()
+    win3.sam_btn.setChecked(True)
+    win3.editor.mousePressEvent(mev(QEvent.Type.MouseButtonPress, win3.editor._to_view(200, 200)))
+    win3.on_run_sam()
+    for _ in range(200):
+        QApplication.processEvents()
+        if len(win3.editor.shapes) == 1:
+            break
+        time.sleep(0.02)
+    assert len(win3.editor.shapes) == 1, "异步 SAM 分割未新增标注"
+    assert win3.editor.shapes[0].has_polygon, "异步分割结果应为多边形"
+    win3.close()
+    print("12. 异步打点分割 OK")
 
     print("RESULT: OK - 标注修正器测试全部通过")
 

@@ -14,6 +14,7 @@
 """
 import math
 import os
+import threading
 
 from PySide6.QtCore import Qt, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
@@ -104,11 +105,20 @@ def _dist_seg(p, a, b):
     return math.hypot(p.x() - (a.x() + t * dx), p.y() - (a.y() + t * dy))
 
 
+def _poly_bbox(poly):
+    """多边形外接矩形 [x1, y1, x2, y2]。"""
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return [min(xs), min(ys), max(xs), max(ys)]
+
+
 class AnnotationEditor(QWidget):
     """可交互的画布：显示原图 + 标注，支持点修正、加点删点、整体移动、缩放平移。"""
 
     edited = Signal()                    # 有几何/属性被修改
     selected_changed = Signal(object)    # 选中形状变化（Shape 或 None）
+    sam_points_changed = Signal()        # 打点分割的点集变化
+    polygon_created = Signal(object)     # 手动新建多边形完成（顶点列表）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -121,6 +131,11 @@ class AnnotationEditor(QWidget):
         self._zoom = 1.0
         self._pan = QPointF(0, 0)
         self._drag = None    # ("point", shape, idx) | ("shape", shape, pos) | ("pan", pos)
+        self._sam_mode = False
+        self._sam_points = []    # 图像坐标 [[x, y], ...]
+        self._sam_labels = []    # [1 / -1, ...]
+        self._poly_mode = False
+        self._draft_poly = []    # 图像坐标 [[x, y], ...]
         self.setMinimumSize(320, 240)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -152,6 +167,11 @@ class AnnotationEditor(QWidget):
         self._pixmap = None
         self._img_w = self._img_h = 0
         self._zoom, self._pan = 1.0, QPointF(0, 0)
+        self._sam_mode = False
+        self._sam_points = []
+        self._sam_labels = []
+        self._poly_mode = False
+        self._draft_poly = []
         self.update()
 
     def set_record(self, rec):
@@ -199,6 +219,43 @@ class AnnotationEditor(QWidget):
             polys.append([[round(x, 1), round(y, 1)] for x, y in (s.polygon or [])])
         rec["boxes"] = boxes
         rec["polygons"] = polys
+
+    def set_sam_mode(self, on):
+        self._sam_mode = on
+        if on:
+            self._poly_mode = False
+        if not on:
+            self._sam_points = []
+            self._sam_labels = []
+        self.update()
+
+    def set_poly_mode(self, on):
+        self._poly_mode = on
+        if on:
+            self._sam_mode = False
+        if not on:
+            self._draft_poly = []
+        self.update()
+
+    def get_sam_points(self):
+        return list(self._sam_points), list(self._sam_labels)
+
+    def clear_sam_points(self):
+        self._sam_points = []
+        self._sam_labels = []
+        self.sam_points_changed.emit()
+        self.update()
+
+    def add_shape(self, name, polygon, confidence=1.0):
+        """新增一条标注（打点分割结果 / 手动多边形），自动派生外接矩形。"""
+        poly = [list(p) for p in polygon] if polygon else None
+        box = _poly_bbox(poly) if poly and len(poly) >= 3 else None
+        sh = Shape(name, confidence, box=box, polygon=poly, color=_color_for(len(self.shapes)))
+        self.shapes.append(sh)
+        self._select(sh)
+        self.edited.emit()
+        self.update()
+        return sh
 
     def select_shape(self, shape):
         self._select(shape)
@@ -259,6 +316,29 @@ class AnnotationEditor(QWidget):
         pos = e.position()
         if e.button() == Qt.MouseButton.MiddleButton:
             self._drag = ("pan", pos)
+            return
+        # 打点分割模式：左键加正样本点，右键加负样本点
+        if self._sam_mode:
+            if e.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+                ix, iy = self._to_img(pos.x(), pos.y())
+                ix = min(max(ix, 0.0), self._img_w)
+                iy = min(max(iy, 0.0), self._img_h)
+                self._sam_points.append([round(ix, 1), round(iy, 1)])
+                self._sam_labels.append(1 if e.button() == Qt.MouseButton.LeftButton else -1)
+                self.sam_points_changed.emit()
+                self.update()
+            return
+        # 新建多边形模式：左键加点，右键撤销
+        if self._poly_mode:
+            if e.button() == Qt.MouseButton.LeftButton:
+                ix, iy = self._to_img(pos.x(), pos.y())
+                ix = min(max(ix, 0.0), self._img_w)
+                iy = min(max(iy, 0.0), self._img_h)
+                self._draft_poly.append([round(ix, 1), round(iy, 1)])
+                self.update()
+            elif e.button() == Qt.MouseButton.RightButton and self._draft_poly:
+                self._draft_poly.pop()
+                self.update()
             return
         if e.button() != Qt.MouseButton.LeftButton:
             return
@@ -332,7 +412,16 @@ class AnnotationEditor(QWidget):
         self._drag = None
 
     def mouseDoubleClickEvent(self, e):
-        if e.button() != Qt.MouseButton.LeftButton or self._pixmap is None:
+        if self._pixmap is None:
+            return
+        # 新建多边形模式：双击闭合完成
+        if self._poly_mode and e.button() == Qt.MouseButton.LeftButton:
+            if len(self._draft_poly) >= 3:
+                self.polygon_created.emit(list(self._draft_poly))
+            self._draft_poly = []
+            self.update()
+            return
+        if e.button() != Qt.MouseButton.LeftButton:
             return
         pos = e.position()
         hit = self._hit_handle(pos)
@@ -393,6 +482,31 @@ class AnnotationEditor(QWidget):
                      self._pixmap, QRectF(0, 0, self._img_w, self._img_h))
         for idx, sh in enumerate(self.shapes):
             self._draw_shape(p, sh)
+        # 打点模式：绘制已收集的提示点
+        if self._sam_mode:
+            for (px, py), lab in zip(self._sam_points, self._sam_labels):
+                vx, vy = self._to_view(px, py)
+                c = QColor(0, 255, 0) if lab > 0 else QColor(255, 60, 60)
+                p.setBrush(c)
+                p.setPen(QPen(c, 2))
+                p.drawEllipse(QPointF(vx, vy), 5, 5)
+                p.setPen(QColor(255, 255, 255))
+                p.drawText(int(vx) + 7, int(vy) - 7, "+" if lab > 0 else "-")
+        # 新建多边形模式：绘制草稿折线
+        if self._poly_mode and self._draft_poly:
+            pts = [QPointF(*self._to_view(x, y)) for x, y in self._draft_poly]
+            if len(pts) >= 2:
+                path = QPainterPath()
+                path.moveTo(pts[0])
+                for pt in pts[1:]:
+                    path.lineTo(pt)
+                p.setPen(QPen(QColor(255, 255, 0), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawPath(path)
+            for pt in pts:
+                p.setPen(QPen(QColor(255, 255, 0), 2))
+                p.setBrush(QColor(255, 255, 0))
+                p.drawEllipse(pt, 4, 4)
 
     def _draw_shape(self, p, sh):
         sel = sh is self.selected
@@ -433,12 +547,16 @@ class AnnotationEditor(QWidget):
 
 
 class AnnotationEditorWindow(QMainWindow):
-    """标注修正主窗口：画布 + 标注列表 + 类别/置信度编辑 + 上一张/下一张导航。
+    """标注修正主窗口：画布 + 标注列表 + 类别/置信度编辑 + 上一张/下一张导航，
+    支持打点交互式重跑 SAM 分割与手动新建多边形补漏标。
 
     records 为共享列表（主程序 self.records），修正实时写回其中的记录。
+    sam_segmenter 为可选回调 (image_path, points, labels) -> polygon，用于打点分割。
     """
 
-    def __init__(self, records, index=0, parent=None):
+    _sam_result = Signal(object)   # ("ok", polygon) | ("err", msg)
+
+    def __init__(self, records, index=0, parent=None, sam_segmenter=None):
         super().__init__(parent)
         self.setWindowTitle("标注修正")
         fit_to_screen(self, 1120, 760)
@@ -448,6 +566,8 @@ class AnnotationEditorWindow(QMainWindow):
         if self.records and 0 <= index < len(records) and records[index] in self.records:
             self.index = self.records.index(records[index])
         self._sel_shape = None
+        self._sam_segmenter = sam_segmenter
+        self._sam_result.connect(self.on_sam_result)
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -492,11 +612,34 @@ class AnnotationEditorWindow(QMainWindow):
         attr.addWidget(self.delete_btn)
         root.addLayout(attr)
 
+        # ---- 顶部工具行 3：打点分割 + 新建多边形
+        tool = QHBoxLayout()
+        self.sam_btn = QPushButton("🔍 打点分割")
+        self.sam_btn.setCheckable(True)
+        self.sam_btn.toggled.connect(self.on_sam_mode)
+        self.run_sam_btn = QPushButton("▶ 执行分割")
+        self.run_sam_btn.setEnabled(False)
+        self.run_sam_btn.clicked.connect(self.on_run_sam)
+        self.clear_pts_btn = QPushButton("✕ 清除点")
+        self.clear_pts_btn.setEnabled(False)
+        self.clear_pts_btn.clicked.connect(self.on_clear_points)
+        self.poly_btn = QPushButton("➕ 新建多边形")
+        self.poly_btn.setCheckable(True)
+        self.poly_btn.toggled.connect(self.on_poly_mode)
+        tool.addWidget(self.sam_btn)
+        tool.addWidget(self.run_sam_btn)
+        tool.addWidget(self.clear_pts_btn)
+        tool.addWidget(self.poly_btn)
+        tool.addStretch(1)
+        root.addLayout(tool)
+
         # ---- 主体：画布 + 右侧列表
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.editor = AnnotationEditor()
         self.editor.edited.connect(self.on_edited)
         self.editor.selected_changed.connect(self.on_selected_changed)
+        self.editor.sam_points_changed.connect(self.on_points_changed)
+        self.editor.polygon_created.connect(self.on_polygon_created)
         splitter.addWidget(self.editor)
 
         right = QWidget()
@@ -548,6 +691,8 @@ class AnnotationEditorWindow(QMainWindow):
         self.next_btn.setEnabled(index < len(self.records) - 1)
         self._sel_shape = None
         self.status_label.setText("")
+        self.sam_btn.setChecked(False)
+        self.poly_btn.setChecked(False)
         self.refresh_list()
         self.update_attr_controls()
 
@@ -589,6 +734,71 @@ class AnnotationEditorWindow(QMainWindow):
 
     def on_delete_clicked(self):
         self.editor.delete_selected()
+
+    # ------------------------------------------------- 打点分割 / 新建多边形
+    def on_sam_mode(self, on):
+        self.editor.set_sam_mode(on)
+        if on:
+            self.poly_btn.setChecked(False)
+            self.status_label.setText("打点模式：左键=正样本点，右键=负样本点，点“执行分割”")
+        self.run_sam_btn.setEnabled(on)
+        self.clear_pts_btn.setEnabled(on)
+
+    def on_poly_mode(self, on):
+        self.editor.set_poly_mode(on)
+        if on:
+            self.sam_btn.setChecked(False)
+            self.status_label.setText("新建多边形：左键加点，右键撤销，双击闭合完成")
+
+    def on_clear_points(self):
+        self.editor.clear_sam_points()
+        self.status_label.setText("已清除打点")
+
+    def on_points_changed(self):
+        pts, _ = self.editor.get_sam_points()
+        self.status_label.setText("已打 %d 个点（左键+ / 右键-），点“执行分割”" % len(pts))
+
+    def on_run_sam(self):
+        points, labels = self.editor.get_sam_points()
+        if not points:
+            QMessageBox.information(self, "提示", "请先在图上打点（左键正样本 / 右键负样本）。")
+            return
+        if self._sam_segmenter is None:
+            QMessageBox.warning(self, "提示", "当前未配置 SAM2 环境，无法打点分割。")
+            return
+        image_path = self.records[self.index].get("image_path", "")
+        self.run_sam_btn.setEnabled(False)
+        self.status_label.setText("SAM 分割中…")
+
+        def worker():
+            try:
+                poly = self._sam_segmenter(image_path, points, labels)
+                self._sam_result.emit(("ok", poly))
+            except Exception as e:  # noqa: BLE001
+                self._sam_result.emit(("err", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_sam_result(self, result):
+        self.run_sam_btn.setEnabled(True)
+        status, payload = result
+        if status == "err":
+            self.status_label.setText("")
+            QMessageBox.warning(self, "分割失败", payload)
+            return
+        poly = payload
+        if not poly or len(poly) < 3:
+            self.status_label.setText("未分割出目标，请调整打点位置后重试")
+            return
+        self.editor.add_shape("sam", poly)
+        self.status_label.setText("已新增分割结果，可在左侧改类别名")
+        self.editor.clear_sam_points()
+        self.refresh_list()
+
+    def on_polygon_created(self, poly):
+        self.editor.add_shape("new", poly)
+        self.status_label.setText("已新建多边形标注，可在左侧改类别名")
+        self.refresh_list()
 
     def on_list_clicked(self, item):
         idx = item.data(Qt.ItemDataRole.UserRole)

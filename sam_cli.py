@@ -56,8 +56,7 @@ class Segmenter:
         self.predictor = load_model(checkpoint, config)
         self._image = None
 
-    def segment(self, image_path, boxes):
-        """对每框中心点做提示分割，返回多边形列表。"""
+    def _read_image(self, image_path):
         import cv2
         import numpy as np
         try:
@@ -65,8 +64,15 @@ class Segmenter:
         except Exception:
             img = None
         if img is None:
+            return None
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def segment(self, image_path, boxes):
+        """对每框中心点做提示分割，返回多边形列表。"""
+        import numpy as np
+        rgb = self._read_image(image_path)
+        if rgb is None:
             return [], "无法读取图片: %s" % image_path
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         self.predictor.set_image(rgb)
         polys = []
         for b in boxes:
@@ -80,9 +86,24 @@ class Segmenter:
                 )
                 best = int(scores.argmax())
                 polys.append(mask_to_polygon(masks[best]))
-            except Exception as e:
+            except Exception:
                 polys.append([])
         return polys, None
+
+    def segment_points(self, image_path, points, labels=None):
+        """用点提示（正/负样本）做分割，返回 [polygon]（失败为空列表）。"""
+        import numpy as np
+        rgb = self._read_image(image_path)
+        if rgb is None:
+            return [], "无法读取图片: %s" % image_path
+        self.predictor.set_image(rgb)
+        coords = np.array([[float(p[0]), float(p[1])] for p in points], dtype=np.float32)
+        labs = np.array([int(l) for l in (labels or [1] * len(points))])
+        masks, scores, _ = self.predictor.predict(
+            point_coords=coords, point_labels=labs, multimask_output=True)
+        best = int(scores.argmax())
+        poly = mask_to_polygon(masks[best])
+        return [poly] if poly else [], None
 
 
 def main():
@@ -103,8 +124,13 @@ def main():
     def handle(task):
         try:
             image = task["image"]
-            boxes = task.get("boxes") or []
-            polys, err = seg.segment(image, boxes)
+            if "points" in task:
+                points = task.get("points") or []
+                labels = task.get("labels") or [1] * len(points)
+                polys, err = seg.segment_points(image, points, labels)
+            else:
+                boxes = task.get("boxes") or []
+                polys, err = seg.segment(image, boxes)
             return {"polygons": polys, "error": err}
         except Exception as e:
             return {"polygons": [], "error": "%s: %s" % (type(e).__name__, e)}
