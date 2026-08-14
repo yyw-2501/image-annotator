@@ -474,9 +474,9 @@ class MainWindow(QMainWindow):
             browse_btn.clicked.connect(lambda _c=False, f=fmt: self.pick_export_dir(f))
             cb.toggled.connect(lambda on, b=browse_btn: b.setEnabled(on))
             self.export_rows[fmt] = (cb, path_edit, browse_btn)
-            gl.addWidget(cb, i, 0, 1, 3)
-            gl.addWidget(path_edit, i + 4, 0, 1, 3)
-            gl.addWidget(browse_btn, i + 4, 3)
+            gl.addWidget(cb, i * 2, 0, 1, 3)
+            gl.addWidget(path_edit, i * 2 + 1, 0, 1, 3)
+            gl.addWidget(browse_btn, i * 2 + 1, 3)
         left_layout.addWidget(export_box)
 
         start_row = QHBoxLayout()
