@@ -3,20 +3,24 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 
-基于 OpenAI 兼容视觉 API 的批量图像自动标注桌面工具。拖入图片 → 视觉模型按自定义指令推理（目标检测 / 实例分割）→ 一键导出 **JSON / YOLO TXT / COCO / Markdown / Pascal VOC / LabelMe / CSV / 掩码 PNG** 八种格式，并支持可视化交互修正。
+批量图像自动标注桌面工具，支持两种推理引擎——**OpenAI 兼容视觉 API**（任意 VL 模型）与**本地 YOLO 权重**（训练好的 `.pt` 直接标注）。拖入图片 → 目标检测 / 实例分割 → 一键导出 **JSON / YOLO TXT / COCO / Markdown / Pascal VOC / LabelMe / CSV / 掩码 PNG** 八种格式，并支持可视化交互修正。
 
 ## 功能特性
 
 ### 核心流程
 - **批量拖拽**：图片或整个文件夹直接拖入，自动递归收集、去重
 - **自定义指令**：任意标注指令（如"检测所有车辆，标注品牌与颜色"），默认内置示例，可随时恢复默认
-- **通用后端**：任意 OpenAI 兼容服务（Ollama `/v1`、LM Studio、vLLM、阿里云百炼 DashScope、OpenAI 等），填 Base URL + API Key 即用，模型列表一键拉取或手动填写
+- **双推理引擎**：
+  - **API 视觉模型**：任意 OpenAI 兼容服务（Ollama `/v1`、LM Studio、vLLM、阿里云百炼 DashScope、OpenAI 等），填 Base URL + API Key 即用，模型列表一键拉取或手动填写
+  - **本地 YOLO 权重**：直接加载训练好的 `.pt`（YOLOv5/v8/v10/v11 检测或分割权重，也支持导出的 `.onnx`/`.engine`），离线免费标注
 
 ### 标注模式
 - **目标检测（边界框）**：视觉模型直接输出 `{description, boxes}`，得到类别 + 矩形框 + 置信度
 - **实例分割（轮廓）**：二选一引擎
   - **API 多边形**：模型直接输出轮廓点序列，零额外依赖
   - **本地 SAM2**：视觉模型先出检测框 → 框中心提示 SAM2 → 像素级精确掩码（质量最佳，需 NVIDIA GPU）
+
+> 使用"本地 YOLO 权重"引擎时，标注方式由权重自动决定：检测权重输出边界框，分割权重输出多边形，无需手动选择。
 
 ### 八种导出格式
 | 格式 | 内容 |
@@ -72,6 +76,7 @@
 | PySide6 | 6.8.x（6.11 在部分 Windows 环境有 DLL 加载问题） |
 | 视觉模型 API | 任一 OpenAI 兼容服务（可联网，或本地 Ollama / LM Studio） |
 | SAM2（可选） | 独立 conda 环境，`torch`（CUDA 版）+ `sam2` + `opencv`；NVIDIA GPU 推荐 |
+| 本地 YOLO（可选） | 独立 conda 环境，`torch` + `ultralytics`（`pip install ultralytics torch`） |
 
 ## 安装与启动
 
@@ -121,6 +126,28 @@ python -c "import urllib.request; urllib.request.urlretrieve('https://hf-mirror.
 
 流程：视觉模型检测框（并发）→ SAM2 对每框中心点做像素分割（原图精度，串行 GPU 推理）→ 多边形简化后导出。SAM2 进程为常驻服务，模型仅加载一次（约 3~4s），崩溃自动重启。
 
+## 本地模型：训练好的 YOLO 权重直接标注
+
+无需联网和视觉 API，用自己训练好的权重直接批量标注。
+
+### 环境准备
+
+```bash
+# 创建 conda 环境（名称可自定，程序会自动探测有 ultralytics 的环境）
+conda create -n yolo_env python=3.10 -y
+conda activate yolo_env
+pip install ultralytics torch opencv-python
+```
+
+### 使用
+
+1. 界面"推理引擎"选 **"本地模型（YOLO 权重）"**
+2. 选择权重文件（`.pt`，YOLOv5/v8/v10/v11 的检测或分割权重均可）
+3. 点"自动查找"填充本地环境 Python（或"浏览"手动选择）
+4. 设置信度阈值，拖入图片 → 开始标注
+
+检测权重输出边界框，分割权重输出多边形，程序按权重自动判断。支持你训练好的 `best.pt` 直接标注，无需转换格式。
+
 ## 导出格式示例
 
 **YOLO-seg**（`类id cx cy w h x1 y1 x2 y2 ...`，均归一化）：
@@ -140,6 +167,7 @@ python test_editor.py   # 交互式标注修正器（拖点/加点/删点/移动
 python test_seg.py      # 实例分割全链路（SAM2 真实分割，自动探测 SAM2 环境）
 python test_seg_api.py  # API 多边形模式
 python test_e2e.py      # 端到端：生成测试图 → 推理 → 八格式导出
+python test_local.py    # 本地 YOLO 权重：真实推理 + GUI 本地引擎全流程
 ```
 
 测试后端可通过环境变量覆盖（默认连本机 Ollama）：
@@ -157,6 +185,7 @@ ANNOTATOR_SAM_PYTHON=D:\Anaconda\envs\sam2_env\python.exe python test_seg.py
 ├── exporters.py     # JSON / YOLO / COCO / Markdown / VOC / LabelMe / CSV / 掩码 导出器
 ├── editor.py        # 交互式标注修正器（画布 + 修正窗口）
 ├── sam_cli.py       # SAM2 常驻子进程服务（stdin/stdout JSON 行协议）
+├── local_cli.py     # 本地 YOLO 推理子进程服务（ultralytics，检测/分割）
 ├── checkpoints/     # SAM2 权重（不入库，见上文下载方式）
 ├── requirements.txt # 主环境依赖
 └── test_*.py        # 回归测试脚本（offscreen 运行）

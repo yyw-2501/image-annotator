@@ -147,7 +147,63 @@ class SamWorker:
                 self.proc = None
 
 
-# ---------------------------------------------------------------- SAM2 环境探测
+class LocalWorker:
+    """本地 YOLO 模型常驻子进程客户端（子进程运行于装有 torch+ultralytics 的环境）。
+
+    协议见 local_cli.py：stdin/stdout 逐行 JSON 通信，支持检测 / 分割权重。
+    """
+
+    def __init__(self, python_path, weights, log=None):
+        self.python = python_path
+        self.weights = weights
+        self.log = log or (lambda s: None)
+        self.proc = None
+        self._lock = threading.Lock()
+        self._start()
+
+    def _start(self):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_cli.py")
+        self.proc = subprocess.Popen(
+            [self.python, script, "--serve", "--weights", self.weights],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True, encoding="utf-8", bufsize=1,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def infer(self, image, conf=0.25):
+        """对单张图片做本地推理，返回 objects 列表（name/x1..y2/confidence/points）。"""
+        with self._lock:
+            if not self._alive():
+                self.log("本地模型子进程已退出，重新启动…")
+                self._start()
+            task = json.dumps({"image": image, "conf": conf})
+            try:
+                self.proc.stdin.write(task + "\n")
+                self.proc.stdin.flush()
+                line = self.proc.stdout.readline()
+            except (OSError, ValueError) as e:
+                raise ApiError("本地模型子进程通信失败: %s" % e)
+            if not line:
+                raise ApiError("本地模型子进程无响应（可能环境缺失 torch/ultralytics）")
+            res = json.loads(line)
+            if res.get("error"):
+                raise ApiError("本地模型推理失败: %s" % res["error"])
+            return res.get("objects") or []
+
+    def close(self):
+        with self._lock:
+            if self.proc is not None:
+                try:
+                    self.proc.terminate()
+                except Exception:
+                    pass
+                self.proc = None
+
+
+# ---------------------------------------------------------------- 本地环境探测（SAM2 / YOLO）
 def _candidate_conda_envs():
     """收集候选 conda 环境目录（含 base），来源：conda 命令 / 常见安装位置 / 环境变量。"""
     dirs = []
@@ -239,6 +295,26 @@ def find_sam2_python():
     return None
 
 
+def _env_has_ultralytics(env_dir):
+    """通过文件系统快速判断环境是否已安装 ultralytics（不启动解释器）。"""
+    if sys.platform.startswith("win"):
+        return os.path.isdir(os.path.join(env_dir, "Lib", "site-packages", "ultralytics"))
+    for sp in glob.glob(os.path.join(env_dir, "lib", "python*", "site-packages")):
+        if os.path.isdir(os.path.join(sp, "ultralytics")):
+            return True
+    return False
+
+
+def find_local_python():
+    """自动探测装有 ultralytics 的 conda 环境 Python；找到返回路径，否则返回 None。"""
+    for env_dir in _candidate_conda_envs():
+        if _env_has_ultralytics(env_dir):
+            py = _env_python_exe(env_dir)
+            if py:
+                return py
+    return None
+
+
 class BatchRunner(QThread):
     """后台批量推理 + 导出线程。"""
     sig_item_done = Signal(dict)
@@ -247,7 +323,8 @@ class BatchRunner(QThread):
 
     def __init__(self, images, model, instruction, temperature, max_tokens,
                  concurrency, export_config, max_side=1600, parent=None,
-                 mode="detect", seg_engine=None, sam_worker=None):
+                 mode="detect", seg_engine=None, sam_worker=None,
+                 engine="api", local_worker=None, local_conf=0.25):
         super().__init__(parent)
         self.images = images
         self.model = model
@@ -260,6 +337,9 @@ class BatchRunner(QThread):
         self.mode = mode  # "detect" | "segment"
         self.seg_engine = seg_engine  # "api" | "sam2"
         self.sam_worker = sam_worker
+        self.engine = engine  # "api" | "local"
+        self.local_worker = local_worker
+        self.local_conf = local_conf
         self._stop = threading.Event()
         self._abort_regs = []  # 在途请求的中止器列表（线程安全）
         self._reg_lock = threading.Lock()
@@ -318,7 +398,22 @@ class BatchRunner(QThread):
                     self.sig_log.emit("  ↳ %s 过大，已缩放至最长边 %dpx 再推理，坐标自动换算回原图"
                                       % (os.path.basename(path), int(max(width, height) * scale)))
                 boxes, polygons, description = [], [], ""
-                if self.mode == "segment" and self.seg_engine == "sam2":
+                if self.engine == "local":
+                    self.sig_log.emit("[本地模型] %s" % os.path.basename(path))
+                    objects = self.local_worker.infer(send_path, self.local_conf)
+                    for o in objects:
+                        boxes.append({
+                            "name": o["name"],
+                            "x1": round(o["x1"] / scale, 2), "y1": round(o["y1"] / scale, 2),
+                            "x2": round(o["x2"] / scale, 2), "y2": round(o["y2"] / scale, 2),
+                            "confidence": o["confidence"],
+                        })
+                        if o.get("points"):
+                            polygons.append([[round(p[0] / scale, 1), round(p[1] / scale, 1)]
+                                             for p in o["points"]])
+                    description = "本地模型推理（%s）" % os.path.basename(
+                        getattr(self.local_worker, "weights", ""))
+                elif self.mode == "segment" and self.seg_engine == "sam2":
                     # 两阶段：VL 检测框 → SAM2 分割（SAM2 直接读原图，坐标为原图像素）
                     result = chat_json(self.model, prompt, send_path,
                                        self.temperature, self.max_tokens,
@@ -473,7 +568,17 @@ class MainWindow(QMainWindow):
         left = QWidget()
         left_layout = QVBoxLayout(left)
 
+        engine_box = QGroupBox("推理引擎")
+        el = QVBoxLayout(engine_box)
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("API 视觉模型", "api")
+        self.engine_combo.addItem("本地模型（YOLO 权重）", "local")
+        self.engine_combo.currentIndexChanged.connect(self.on_engine_changed)
+        el.addWidget(self.engine_combo)
+        left_layout.addWidget(engine_box)
+
         model_box = QGroupBox("连接与模型设置")
+        self.model_box = model_box
         ml = QVBoxLayout(model_box)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Base URL:"))
@@ -531,6 +636,41 @@ class MainWindow(QMainWindow):
         row3.addWidget(QLabel("（0=不缩放，超出上下文会报错）"), 1)
         ml.addLayout(row3)
         left_layout.addWidget(model_box)
+
+        local_box = QGroupBox("本地模型设置（YOLO）")
+        self.local_box = local_box
+        ll = QVBoxLayout(local_box)
+        wrow = QHBoxLayout()
+        wrow.addWidget(QLabel("权重文件:"))
+        self.weights_edit = QLineEdit()
+        self.weights_edit.setPlaceholderText("选择 .pt/.onnx 权重（YOLOv5/v8/v10/v11 检测或分割）")
+        wrow.addWidget(self.weights_edit, 1)
+        wbtn = QPushButton("浏览")
+        wbtn.clicked.connect(self.pick_weights)
+        wrow.addWidget(wbtn)
+        ll.addLayout(wrow)
+        erow = QHBoxLayout()
+        erow.addWidget(QLabel("环境 Python:"))
+        self.local_python_edit = QLineEdit()
+        self.local_python_edit.setPlaceholderText("装有 torch+ultralytics 的 conda 环境 python.exe")
+        erow.addWidget(self.local_python_edit, 1)
+        lauto_btn = QPushButton("自动查找")
+        lauto_btn.clicked.connect(self.auto_find_local_python)
+        erow.addWidget(lauto_btn)
+        lpy_btn = QPushButton("浏览")
+        lpy_btn.clicked.connect(self.pick_local_python)
+        erow.addWidget(lpy_btn)
+        ll.addLayout(erow)
+        crow = QHBoxLayout()
+        crow.addWidget(QLabel("置信度阈值:"))
+        self.local_conf_spin = QDoubleSpinBox()
+        self.local_conf_spin.setRange(0.01, 1.0)
+        self.local_conf_spin.setSingleStep(0.05)
+        self.local_conf_spin.setValue(0.25)
+        crow.addWidget(self.local_conf_spin)
+        crow.addStretch(1)
+        ll.addLayout(crow)
+        left_layout.addWidget(local_box)
 
         seg_box = QGroupBox("标注类型")
         sl = QVBoxLayout(seg_box)
@@ -711,6 +851,65 @@ class MainWindow(QMainWindow):
         if folder:
             self.export_rows[fmt][1].setText(folder)
 
+    # ------------------------------------------------------- 引擎与模型
+    def on_engine_changed(self, _idx):
+        is_local = self.engine_combo.currentData() == "local"
+        self.model_box.setVisible(not is_local)
+        self.local_box.setVisible(is_local)
+
+    def pick_weights(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 YOLO 权重", os.path.expanduser("~"),
+            "模型权重 (*.pt *.onnx *.engine);;所有文件 (*)")
+        if path:
+            self.weights_edit.setText(path)
+
+    def pick_local_python(self):
+        start = os.path.expanduser("~")
+        cur = self.local_python_edit.text().strip()
+        if cur and os.path.isdir(os.path.dirname(cur)):
+            start = os.path.dirname(cur)
+        path, _ = QFileDialog.getOpenFileName(self, "选择本地环境 Python", start, "python.exe")
+        if path:
+            self.local_python_edit.setText(path)
+
+    def auto_find_local_python(self):
+        self.log("正在自动探测装有 ultralytics 的环境…")
+        found = find_local_python()
+        if found:
+            self.local_python_edit.setText(found)
+            self.log("已找到本地环境：%s" % found)
+        else:
+            self.log("未找到装有 ultralytics 的 conda 环境。")
+            QMessageBox.information(self, "自动查找",
+                                    "未找到装有 ultralytics 的 conda 环境。\n"
+                                    "请先安装：pip install ultralytics torch")
+
+    def _get_local_worker(self):
+        """获取本地 YOLO worker；失败返回 (None, 错误信息)。"""
+        weights = self.weights_edit.text().strip()
+        python_path = self.local_python_edit.text().strip()
+        if not weights or not os.path.isfile(weights):
+            return None, "请选择有效的 YOLO 权重文件。"
+        if not python_path or not os.path.isfile(python_path):
+            found = find_local_python()
+            if found:
+                python_path = found
+                self.local_python_edit.setText(found)
+        if not python_path or not os.path.isfile(python_path):
+            return None, "未找到装有 torch+ultralytics 的 conda 环境，请点“自动查找”或手动选择。"
+        cur = getattr(self, "local_worker", None)
+        if cur is not None and cur.python == python_path and cur.weights == weights \
+                and cur.proc is not None and cur.proc.poll() is None:
+            return cur, None
+        if cur is not None:
+            cur.close()
+        try:
+            self.local_worker = LocalWorker(python_path, weights, log=self.log)
+        except Exception as e:
+            return None, "本地模型启动失败：%s" % e
+        return self.local_worker, None
+
     # ------------------------------------------------------- 连接与模型
     def on_mode_changed(self, _idx):
         seg_mode = self.mode_combo.currentData() == "segment"
@@ -825,17 +1024,27 @@ class MainWindow(QMainWindow):
         if not images:
             QMessageBox.information(self, "提示", "请先拖入图片。")
             return
-        if not self.base_url_edit.text().strip():
-            QMessageBox.warning(self, "提示", "请先填写 Base URL（如 http://127.0.0.1:11434/v1）。")
-            return
-        model_name = self.current_model_name()
-        if not model_name:
-            QMessageBox.warning(self, "提示", "没有可用视觉模型，请刷新获取或手动输入模型名。")
-            return
-        instruction = self.prompt_edit.toPlainText().strip()
-        if not instruction:
-            QMessageBox.warning(self, "提示", "请填写标注指令。")
-            return
+        engine = self.engine_combo.currentData()
+        local_worker = None
+        if engine == "api":
+            if not self.base_url_edit.text().strip():
+                QMessageBox.warning(self, "提示", "请先填写 Base URL（如 http://127.0.0.1:11434/v1）。")
+                return
+            model_name = self.current_model_name()
+            if not model_name:
+                QMessageBox.warning(self, "提示", "没有可用视觉模型，请刷新获取或手动输入模型名。")
+                return
+            instruction = self.prompt_edit.toPlainText().strip()
+            if not instruction:
+                QMessageBox.warning(self, "提示", "请填写标注指令。")
+                return
+        else:
+            local_worker, err = self._get_local_worker()
+            if local_worker is None:
+                QMessageBox.warning(self, "提示", err)
+                return
+            model_name = ""
+            instruction = "本地模型标注"
 
         export_config = {}
         for fmt, (cb, path_edit, _btn) in self.export_rows.items():
@@ -896,6 +1105,8 @@ class MainWindow(QMainWindow):
             self.max_side_spin.value(),
             self,
             mode=mode, seg_engine=seg_engine, sam_worker=sam_worker,
+            engine=engine, local_worker=local_worker,
+            local_conf=self.local_conf_spin.value(),
         )
         self.runner.api_config = self.api_config()
         self.runner.sig_item_done.connect(self.on_item_done)
@@ -1000,6 +1211,10 @@ class MainWindow(QMainWindow):
         s.setValue("mode", self.mode_combo.currentData())
         s.setValue("seg_engine", self.seg_engine_combo.currentData())
         s.setValue("sam_python", self.sam_python_edit.text().strip())
+        s.setValue("engine", self.engine_combo.currentData())
+        s.setValue("weights", self.weights_edit.text().strip())
+        s.setValue("local_python", self.local_python_edit.text().strip())
+        s.setValue("local_conf", self.local_conf_spin.value())
         for fmt, (cb, path_edit, _b) in self.export_rows.items():
             s.setValue("export_%s_on" % fmt, cb.isChecked())
             s.setValue("export_%s_dir" % fmt, path_edit.text().strip())
@@ -1023,6 +1238,18 @@ class MainWindow(QMainWindow):
         sam_python = s.value("sam_python", "")
         if sam_python:
             self.sam_python_edit.setText(sam_python)
+        engine = s.value("engine", "api")
+        idx = self.engine_combo.findData(engine)
+        if idx >= 0:
+            self.engine_combo.blockSignals(True)
+            self.engine_combo.setCurrentIndex(idx)
+            self.engine_combo.blockSignals(False)
+        self.weights_edit.setText(s.value("weights", ""))
+        local_py = s.value("local_python", "")
+        if local_py:
+            self.local_python_edit.setText(local_py)
+        self.local_conf_spin.setValue(float(s.value("local_conf", 0.25)))
+        self.on_engine_changed(None)
         self.on_mode_changed(None)
         self.prompt_edit.setPlainText(
             s.value("instruction", DEFAULT_INSTRUCTION))
@@ -1046,6 +1273,9 @@ class MainWindow(QMainWindow):
         worker = getattr(self, "sam_worker", None)
         if worker is not None:
             worker.close()
+        lworker = getattr(self, "local_worker", None)
+        if lworker is not None:
+            lworker.close()
         event.accept()
 
 
