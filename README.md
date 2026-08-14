@@ -19,6 +19,13 @@
   | YOLO TXT | 每图 `.txt` + `classes.txt`；实例分割时自动切换 YOLO-seg 格式（class cx cy w h + 归一化多边形点） |
   | COCO | 单文件 `annotations.json`，含 `segmentation` 多边形 |
   | Markdown | 图文报告 `.md`（图片自动复制），含轮廓点数列 |
+- **共 8 种导出格式**（除以上四种外）：
+  | 格式 | 内容 |
+  |---|---|
+  | Pascal VOC XML | 每图一个 `.xml`，`bndbox` + `polygon` 扩展标签，检测/分割训练标准格式 |
+  | LabelMe JSON | 每图一个 `.json`，`shapes` 多边形（无分割时回退 rectangle），可直接在 LabelMe 打开 |
+  | CSV 汇总 | 单文件 `annotations.csv`（图片、类别、坐标、置信度、轮廓点数、描述） |
+  | 分割掩码 PNG | 每图一个类别着色掩码（背景 0，类别从 1 编号），可直接用于语义分割训练 |
 - **工程化细节**：并发批处理（可调）、一键停止（中断在途请求）、大图自动缩放（坐标换算回原图）、max_tokens 超限自动降级、JSON 解析容错重试、失败图片空标注兜底、设置持久化
 - **智能诊断**：空检测结果时输出模型描述，快速分辨"图中无目标"与"模型无视觉能力"
 

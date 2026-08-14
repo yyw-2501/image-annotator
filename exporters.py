@@ -6,9 +6,11 @@ records 中每条记录的字段:
     description, boxes: [{name,x1,y1,x2,y2,confidence}],
     model, timestamp, status("ok"/"error"), raw_response
 """
+import csv
 import json
 import os
 import shutil
+import xml.etree.ElementTree as ET
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
 
@@ -208,9 +210,151 @@ def export_markdown(records, out_dir, log=None):
     return count
 
 
+# ---------------------------------------------------------------- Pascal VOC XML
+def export_voc(records, out_dir, log=None):
+    """Pascal VOC 格式：每图一个 .xml，含 bndbox；有分割数据时附 polygon 扩展标签。"""
+    _mkdir(out_dir)
+    count = 0
+    for rec in records:
+        ann = ET.Element("annotation")
+        ET.SubElement(ann, "folder").text = os.path.basename(out_dir)
+        ET.SubElement(ann, "filename").text = rec["file_name"]
+        src = ET.SubElement(ann, "source")
+        ET.SubElement(src, "database").text = "image-annotator"
+        size = ET.SubElement(ann, "size")
+        ET.SubElement(size, "width").text = str(rec["width"])
+        ET.SubElement(size, "height").text = str(rec["height"])
+        ET.SubElement(size, "depth").text = "3"
+        ET.SubElement(ann, "segmented").text = "1"
+        polys = _rec_polygons(rec)
+        for i, b in enumerate(rec.get("boxes", [])):
+            obj = ET.SubElement(ann, "object")
+            ET.SubElement(obj, "name").text = b["name"]
+            ET.SubElement(obj, "pose").text = "Unspecified"
+            ET.SubElement(obj, "truncated").text = "0"
+            ET.SubElement(obj, "difficult").text = "0"
+            ET.SubElement(obj, "confidence").text = "%.4f" % b["confidence"]
+            bb = ET.SubElement(obj, "bndbox")
+            ET.SubElement(bb, "xmin").text = str(int(b["x1"]))
+            ET.SubElement(bb, "ymin").text = str(int(b["y1"]))
+            ET.SubElement(bb, "xmax").text = str(int(b["x2"]))
+            ET.SubElement(bb, "ymax").text = str(int(b["y2"]))
+            if polys and polys[i]:
+                pg = ET.SubElement(obj, "polygon")
+                for x, y in polys[i]:
+                    pt = ET.SubElement(pg, "pt")
+                    ET.SubElement(pt, "x").text = str(int(round(x)))
+                    ET.SubElement(pt, "y").text = str(int(round(y)))
+        target = os.path.join(out_dir, os.path.splitext(rec["file_name"])[0] + ".xml")
+        ET.ElementTree(ann).write(target, encoding="utf-8", xml_declaration=True)
+        count += 1
+    return count
+
+
+# ---------------------------------------------------------------- LabelMe
+def export_labelme(records, out_dir, log=None):
+    """LabelMe 格式：每图一个 .json，shapes 为多边形（无分割时用 rectangle）。"""
+    _mkdir(out_dir)
+    count = 0
+    for rec in records:
+        shapes = []
+        polys = _rec_polygons(rec)
+        for i, b in enumerate(rec.get("boxes", [])):
+            if polys and polys[i]:
+                shapes.append({
+                    "label": b["name"],
+                    "points": [[float(x), float(y)] for x, y in polys[i]],
+                    "group_id": None,
+                    "shape_type": "polygon",
+                    "flags": {},
+                })
+            else:
+                shapes.append({
+                    "label": b["name"],
+                    "points": [[float(b["x1"]), float(b["y1"])],
+                               [float(b["x2"]), float(b["y2"])]],
+                    "group_id": None,
+                    "shape_type": "rectangle",
+                    "flags": {},
+                })
+        data = {
+            "version": "5.2.1",
+            "flags": {},
+            "shapes": shapes,
+            "imagePath": rec["file_name"],
+            "imageData": None,
+            "imageWidth": rec["width"],
+            "imageHeight": rec["height"],
+            "description": rec.get("description", ""),
+        }
+        target = os.path.join(out_dir, os.path.splitext(rec["file_name"])[0] + ".json")
+        with open(target, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        count += 1
+    return count
+
+
+# ---------------------------------------------------------------- CSV 汇总
+def export_csv(records, out_dir, log=None):
+    """汇总 CSV：每目标一行（图片、类别、坐标、置信度、轮廓点数），另附图片描述列。"""
+    _mkdir(out_dir)
+    target = os.path.join(out_dir, "annotations.csv")
+    desc_map = {rec["file_name"]: rec.get("description", "") for rec in records}
+    with open(target, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["image", "class", "confidence", "x1", "y1", "x2", "y2",
+                         "width", "height", "polygon_points", "description"])
+        for rec in records:
+            polys = _rec_polygons(rec)
+            for i, b in enumerate(rec.get("boxes", [])):
+                writer.writerow([
+                    rec["file_name"], b["name"], b["confidence"],
+                    int(b["x1"]), int(b["y1"]), int(b["x2"]), int(b["y2"]),
+                    rec["width"], rec["height"],
+                    len(polys[i]) if polys and polys[i] else 0,
+                    desc_map.get(rec["file_name"], ""),
+                ])
+    return 1
+
+
+# ---------------------------------------------------------------- 语义分割掩码 PNG
+def export_mask(records, out_dir, log=None):
+    """语义分割掩码：每图一个 PNG，像素值=类别 id（背景 0）。有轮廓用多边形填充，否则用 bbox 填充。"""
+    from PIL import Image, ImageDraw
+    _mkdir(out_dir)
+    classes = _yolo_classes(records)
+    cls_id = {name: i + 1 for i, name in enumerate(classes)}
+    count = 0
+    for rec in records:
+        w, h = rec["width"], rec["height"]
+        if w <= 0 or h <= 0:
+            continue
+        mask = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(mask)
+        polys = _rec_polygons(rec)
+        for i, b in enumerate(rec.get("boxes", [])):
+            cid = cls_id[b["name"]]
+            if polys and polys[i]:
+                pts = [(int(round(x)), int(round(y))) for x, y in polys[i]]
+                if len(pts) >= 3:
+                    draw.polygon(pts, fill=cid)
+                    continue
+            draw.rectangle([int(b["x1"]), int(b["y1"]), int(b["x2"]), int(b["y2"])], fill=cid)
+        target = os.path.join(out_dir, os.path.splitext(rec["file_name"])[0] + "_mask.png")
+        mask.save(target, "PNG")
+        count += 1
+    if log and classes:
+        log("掩码类别索引: %s" % ", ".join("%s=%d" % (n, cls_id[n]) for n in classes))
+    return count
+
+
 EXPORTERS = {
     "json": ("JSON", export_json),
     "yolo": ("YOLO TXT", export_yolo),
     "coco": ("COCO", export_coco),
     "markdown": ("Markdown", export_markdown),
+    "voc": ("Pascal VOC XML", export_voc),
+    "labelme": ("LabelMe JSON", export_labelme),
+    "csv": ("CSV 汇总", export_csv),
+    "mask": ("分割掩码 PNG", export_mask),
 }

@@ -34,6 +34,10 @@ FORMAT_LABELS = {
     "yolo": "YOLO TXT（每图 .txt + classes.txt）",
     "coco": "COCO（单文件 annotations.json）",
     "markdown": "Markdown（图文描述 .md，图片自动复制）",
+    "voc": "Pascal VOC XML（每图 .xml）",
+    "labelme": "LabelMe JSON（每图多边形 .json）",
+    "csv": "CSV 汇总（annotations.csv）",
+    "mask": "语义分割掩码 PNG（类别着色）",
 }
 
 
@@ -458,7 +462,7 @@ class MainWindow(QMainWindow):
         export_box = QGroupBox("导出设置（每种格式独立输出目录）")
         gl = QGridLayout(export_box)
         self.export_rows = {}
-        for i, fmt in enumerate(["json", "yolo", "coco", "markdown"]):
+        for i, fmt in enumerate(EXPORTERS):
             cb = QCheckBox(FORMAT_LABELS[fmt])
             cb.toggled.connect(lambda on, f=fmt: self.export_rows[f][1].setEnabled(on)
                                if on else self.export_rows[f][1].setEnabled(False))
