@@ -3,8 +3,9 @@
 
 功能：批量拖拽图片 → OpenAI 兼容视觉模型按自定义指令推理（目标检测 / 实例分割，
       实例分割支持 API 轮廓直出或本地 SAM2 像素分割）→
-      JSON / YOLO TXT / COCO / Markdown 多格式分别导出到独立目录。
+      结果自动导出；双击结果打开交互式修正窗口，手动拖拽/增删轮廓点后重新导出。
 """
+import glob
 import json
 import os
 import subprocess
@@ -27,6 +28,7 @@ from api_client import (
     ApiError, ApiCancel, list_vision_models, chat_json, chat_polygons,
     DEFAULT_INSTRUCTION, SCHEMA_TEXT, SCHEMA_TEXT_POLY,
 )
+from editor import AnnotationEditorWindow, fit_to_screen
 from exporters import collect_images, EXPORTERS
 
 FORMAT_LABELS = {
@@ -39,6 +41,15 @@ FORMAT_LABELS = {
     "csv": "CSV 汇总（annotations.csv）",
     "mask": "语义分割掩码 PNG（类别着色）",
 }
+
+# 常见 OpenAI 兼容服务预设地址（Base URL 下拉快捷填入）
+COMMON_BASE_URLS = [
+    ("Ollama（http://127.0.0.1:11434/v1）", "http://127.0.0.1:11434/v1"),
+    ("LM Studio（http://127.0.0.1:1234/v1）", "http://127.0.0.1:1234/v1"),
+    ("vLLM（http://127.0.0.1:8000/v1）", "http://127.0.0.1:8000/v1"),
+    ("阿里云百炼 DashScope", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ("OpenAI", "https://api.openai.com/v1"),
+]
 
 
 class ImageListWidget(QListWidget):
@@ -122,6 +133,98 @@ class SamWorker:
                 except Exception:
                     pass
                 self.proc = None
+
+
+# ---------------------------------------------------------------- SAM2 环境探测
+def _candidate_conda_envs():
+    """收集候选 conda 环境目录（含 base），来源：conda 命令 / 常见安装位置 / 环境变量。"""
+    dirs = []
+    # 1) 优先用 conda 命令（最准确）；不可用时静默降级
+    try:
+        proc = subprocess.run(
+            ["conda", "env", "list", "--json"],
+            capture_output=True, text=True, timeout=20)
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout or "{}")
+            dirs.extend(p for p in data.get("envs", []) if p and os.path.isdir(p))
+    except Exception:
+        pass
+
+    # 2) 常见安装根目录（base）+ 其 envs/ 子目录
+    roots = []
+    home = os.path.expanduser("~")
+    base_names = ("anaconda3", "miniconda3", "Anaconda3", "Miniconda3",
+                  "anaconda", "miniconda")
+    for name in base_names:
+        roots.append(os.path.join(home, name))
+    if sys.platform.startswith("win"):
+        for drive in ("C:\\", "D:\\", "E:\\"):
+            for name in base_names:
+                roots.append(drive + name)
+            roots.append(drive + "ProgramData\\anaconda3")
+            roots.append(drive + "ProgramData\\miniconda3")
+    else:
+        roots += ["/opt/anaconda3", "/opt/miniconda3", "/usr/local/anaconda3",
+                  "/usr/local/miniconda3", "/opt/conda"]
+
+    # 3) 环境变量
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        roots.append(os.path.dirname(conda_exe))
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        roots.append(conda_prefix)
+
+    seen = set()
+    for root in roots:
+        root = os.path.normpath(root)
+        if not root or root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        dirs.append(root)  # base 本身
+        envs_dir = os.path.join(root, "envs")
+        if os.path.isdir(envs_dir):
+            for name in sorted(os.listdir(envs_dir)):
+                child = os.path.join(envs_dir, name)
+                if os.path.isdir(child):
+                    dirs.append(child)
+
+    # 去重保序
+    result, seen2 = [], set()
+    for d in dirs:
+        d = os.path.normpath(d)
+        if d not in seen2:
+            seen2.add(d)
+            result.append(d)
+    return result
+
+
+def _env_python_exe(env_dir):
+    if sys.platform.startswith("win"):
+        p = os.path.join(env_dir, "python.exe")
+    else:
+        p = os.path.join(env_dir, "bin", "python")
+    return p if os.path.isfile(p) else None
+
+
+def _env_has_sam2(env_dir):
+    """通过文件系统快速判断环境是否已安装 sam2（不启动解释器）。"""
+    if sys.platform.startswith("win"):
+        return os.path.isdir(os.path.join(env_dir, "Lib", "site-packages", "sam2"))
+    for sp in glob.glob(os.path.join(env_dir, "lib", "python*", "site-packages")):
+        if os.path.isdir(os.path.join(sp, "sam2")):
+            return True
+    return False
+
+
+def find_sam2_python():
+    """自动探测装有 sam2 的 conda 环境 Python；找到返回路径，否则返回 None。"""
+    for env_dir in _candidate_conda_envs():
+        if _env_has_sam2(env_dir):
+            py = _env_python_exe(env_dir)
+            if py:
+                return py
+    return None
 
 
 class BatchRunner(QThread):
@@ -342,9 +445,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("图像自动标注工具")
-        self.resize(1180, 760)
+        fit_to_screen(self, 1180, 760)
         self.settings = QSettings("ollama-annotator", "settings")
         self.runner = None
+        self.records = []  # 最近一次批量标注的记录，标注修正在此列表上原地写回
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -361,9 +465,17 @@ class MainWindow(QMainWindow):
         ml = QVBoxLayout(model_box)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Base URL:"))
-        self.base_url_edit = QLineEdit("http://127.0.0.1:1234/v1")
-        self.base_url_edit.setPlaceholderText("http://127.0.0.1:1234/v1")
+        self.base_url_edit = QLineEdit("http://127.0.0.1:11434/v1")
+        self.base_url_edit.setPlaceholderText("http://127.0.0.1:11434/v1")
         row1.addWidget(self.base_url_edit, 1)
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("预设服务…", None)
+        for _label, _url in COMMON_BASE_URLS:
+            self.preset_combo.addItem(_label, _url)
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.setToolTip("一键填入常见 OpenAI 兼容服务地址")
+        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
+        row1.addWidget(self.preset_combo)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self.refresh_models)
         row1.addWidget(self.refresh_btn)
@@ -435,9 +547,13 @@ class MainWindow(QMainWindow):
         sl.addLayout(eng_row)
         py_row = QHBoxLayout()
         py_row.addWidget(QLabel("SAM2 环境 Python:"))
-        self.sam_python_edit = QLineEdit(r"D:\Anaconda\envs\grape_seg\python.exe")
-        self.sam_python_edit.setToolTip("指向装有 torch+sam2 的 conda 环境 python.exe，例如 D:\\Anaconda\\envs\\grape_seg\\python.exe")
+        self.sam_python_edit = QLineEdit()
+        self.sam_python_edit.setPlaceholderText("自动探测或手动选择（装有 torch+sam2 的 conda 环境 python.exe）")
+        self.sam_python_edit.setToolTip("指向装有 torch+sam2 的 conda 环境 python.exe；点“自动查找”可扫描本机 conda 环境")
         py_row.addWidget(self.sam_python_edit, 1)
+        auto_btn = QPushButton("自动查找")
+        auto_btn.clicked.connect(self.auto_find_sam_python)
+        py_row.addWidget(auto_btn)
         py_btn = QPushButton("浏览")
         py_btn.clicked.connect(self.pick_sam_python)
         py_row.addWidget(py_btn)
@@ -515,6 +631,7 @@ class MainWindow(QMainWindow):
         rl.addWidget(tip)
         self.image_list = ImageListWidget()
         self.image_list.dropped.connect(self.on_dropped)
+        self.image_list.itemDoubleClicked.connect(self.open_editor_for)
         rl.addWidget(self.image_list, 1)
         count_row = QHBoxLayout()
         self.count_label = QLabel("共 0 张图片")
@@ -527,6 +644,16 @@ class MainWindow(QMainWindow):
         count_row.addWidget(add_btn)
         count_row.addWidget(add_btn2)
         rl.addLayout(count_row)
+        edit_row = QHBoxLayout()
+        fix_btn = QPushButton("✎ 修正标注")
+        fix_btn.setToolTip("打开修正窗口，手动拖拽/增删轮廓点（也可双击图片列表项）")
+        fix_btn.clicked.connect(lambda: self.open_editor(None))
+        export_fixed_btn = QPushButton("导出修正后结果")
+        export_fixed_btn.setToolTip("用修正后的标注数据重新执行已勾选的导出格式")
+        export_fixed_btn.clicked.connect(self.export_corrected)
+        edit_row.addWidget(fix_btn)
+        edit_row.addWidget(export_fixed_btn)
+        rl.addLayout(edit_row)
         splitter.addWidget(right)
 
         splitter.setSizes([520, 660])
@@ -586,10 +713,37 @@ class MainWindow(QMainWindow):
         self.seg_engine_combo.setEnabled(seg_mode)
         self.sam_python_edit.setEnabled(seg_mode and self.seg_engine_combo.currentData() == "sam2")
 
+    def _apply_preset(self, idx):
+        url = self.preset_combo.itemData(idx)
+        if not url:
+            return
+        self.base_url_edit.setText(url)
+        self.log("已填入预设服务地址：%s" % url)
+        self.preset_combo.setCurrentIndex(0)
+
     def pick_sam_python(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择 SAM2 环境 Python", r"D:\Anaconda\envs", "python.exe")
+        start = os.path.expanduser("~")
+        cur = self.sam_python_edit.text().strip()
+        if cur and os.path.isdir(os.path.dirname(cur)):
+            start = os.path.dirname(cur)
+        path, _ = QFileDialog.getOpenFileName(self, "选择 SAM2 环境 Python", start, "python.exe")
         if path:
             self.sam_python_edit.setText(path)
+
+    def auto_find_sam_python(self):
+        """扫描本机 conda 环境，自动填充装有 sam2 的 Python 路径。"""
+        self.log("正在自动探测 SAM2 环境（扫描 conda 环境目录）…")
+        found = find_sam2_python()
+        if found:
+            self.sam_python_edit.setText(found)
+            self.log("已找到 SAM2 环境：%s" % found)
+            QMessageBox.information(self, "自动查找", "已找到 SAM2 环境：\n%s" % found)
+        else:
+            self.log("未找到装有 sam2 的 conda 环境。")
+            QMessageBox.information(self, "自动查找",
+                                    "未在本机找到装有 sam2 的 conda 环境。\n\n"
+                                    "请先按 README“实例分割：SAM2 本地引擎”章节创建环境并安装，"
+                                    "或改用“API 多边形”分割引擎（无需本地环境）。")
 
     def _ensure_sam_worker(self, python_path):
         """按需创建/复用 SAM2 常驻子进程（换路径时重建）。"""
@@ -672,8 +826,22 @@ class MainWindow(QMainWindow):
         if mode == "segment" and seg_engine == "sam2":
             python_path = self.sam_python_edit.text().strip()
             if not python_path or not os.path.isfile(python_path):
+                self.log("SAM2 环境路径无效，尝试自动探测…")
+                found = find_sam2_python()
+                if found:
+                    python_path = found
+                    self.sam_python_edit.setText(found)
+                    self.log("已自动探测到 SAM2 环境：%s" % found)
+            if not python_path or not os.path.isfile(python_path):
                 QMessageBox.warning(self, "提示", "找不到 SAM2 环境 Python：\n%s\n\n"
-                                    "请选择装有 torch+sam2 的 conda 环境 python.exe（如 D:\\Anaconda\\envs\\grape_seg\\python.exe）。" % python_path)
+                                    "请点右侧“自动查找”，或选择装有 torch+sam2 的 conda 环境 python.exe。" % python_path)
+                return
+            ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "checkpoints", "sam2.1_hiera_tiny.pt")
+            if not os.path.isfile(ckpt):
+                QMessageBox.warning(self, "缺少 SAM2 权重",
+                                    "未找到 SAM2 权重文件：\n%s\n\n"
+                                    "请按 README“实例分割：SAM2 本地引擎”章节下载权重到 checkpoints/ 目录。" % ckpt)
                 return
             try:
                 sam_worker = self._ensure_sam_worker(python_path)
@@ -733,11 +901,62 @@ class MainWindow(QMainWindow):
             self.log("— 导出汇总 —")
             for fmt, info in summary["exports"].items():
                 self.log("  %s: %s（%d 个文件）" % (info["label"], info["dir"], info["files"]))
+        self.records[:] = summary.get("records", [])
+        self.log("已保存 %d 条标注记录，可在右侧列表双击图片打开修正窗口，或点“导出修正后结果”。"
+                 % len(self.records))
         msg = "批量标注完成\n成功 %d / 失败 %d" % (summary["ok"], summary["failed"])
         if summary["exports"]:
             msg += "\n\n导出目录：\n" + "\n".join(
                 "• %s → %s" % (i["label"], i["dir"]) for i in summary["exports"].values())
         QMessageBox.information(self, "完成", msg)
+
+    # ------------------------------------------------------- 交互式修正
+    def _rec_for_item(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return None
+        path = os.path.normpath(path)
+        for r in self.records:
+            if os.path.normpath(r.get("image_path", "")) == path:
+                return r
+        return None
+
+    def open_editor_for(self, item):
+        self.open_editor(self._rec_for_item(item))
+
+    def open_editor(self, rec=None):
+        ok_recs = [r for r in self.records if r.get("status") == "ok"]
+        if not ok_recs:
+            QMessageBox.information(self, "提示", "请先运行批量标注，再进行标注修正。")
+            return
+        index = 0
+        if rec is not None and rec in ok_recs:
+            index = ok_recs.index(rec)
+        win = AnnotationEditorWindow(self.records, index, self)
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def export_corrected(self):
+        if not self.records:
+            QMessageBox.information(self, "提示", "请先运行批量标注，再导出修正结果。")
+            return
+        enabled = {}
+        for fmt, (cb, path_edit, _btn) in self.export_rows.items():
+            if cb.isChecked() and path_edit.text().strip():
+                enabled[fmt] = path_edit.text().strip()
+        if not enabled:
+            QMessageBox.information(self, "提示", "未勾选任何导出格式或未选择导出目录。")
+            return
+        self.log("— 重新导出（修正后数据）—")
+        for fmt, out_dir in enabled.items():
+            try:
+                label, func = EXPORTERS[fmt]
+                n = func(self.records, out_dir, log=self.log)
+                self.log("导出 %s → %s（%d 个文件）" % (label, out_dir, n))
+            except Exception as e:
+                self.log("导出 %s 失败: %s" % (fmt, e))
+        QMessageBox.information(self, "完成", "修正后数据已重新导出到已勾选格式的目录。")
 
     # ------------------------------------------------------- 设置持久化
     def _save_settings(self):

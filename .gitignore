@@ -8,7 +8,8 @@ __pycache__/
 venv/
 
 # SAM2 权重（约 148MB，超出 GitHub 单文件限制，README 提供下载方式）
-checkpoints/
+checkpoints/*
+!checkpoints/.gitkeep
 
 # 测试产物
 test_run/

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """端到端自测：生成测试图 → Ollama 推理 → 四种格式导出。"""
 import os
 import time
@@ -29,7 +29,12 @@ def make_test_images():
 
 
 def main():
-    model = "qwen3-vl:4b"
+    # 通过环境变量配置后端，默认连本机 Ollama（可在分享给他人时按需覆盖）
+    model = os.environ.get("ANNOTATOR_MODEL", "qwen3-vl:4b")
+    base_url = os.environ.get("ANNOTATOR_BASE_URL", "http://127.0.0.1:11434/v1")
+    api_key = os.environ.get("ANNOTATOR_API_KEY", "")
+    api_config = {"base_url": base_url, "api_key": api_key}
+    print("后端: %s（模型 %s）" % (base_url, model))
     paths = make_test_images()
     prompt = "%s\n\n%s" % (DEFAULT_INSTRUCTION, SCHEMA_TEXT)
 
@@ -38,7 +43,7 @@ def main():
         t0 = time.time()
         try:
             res = chat_json(model, prompt, p, temperature=0.1, max_tokens=4096,
-                            retries=3, log=print)
+                            retries=3, log=print, api_config=api_config)
             print("推理 %s 用时 %.1fs -> boxes=%d, desc=%s"
                   % (os.path.basename(p), time.time() - t0, len(res["boxes"]),
                      res["description"][:40]))

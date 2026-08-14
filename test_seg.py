@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""SAM2 全链路端到端测试：mock VL API（返回 bbox）→ 真实 SAM2 分割 → 三格式导出验证。
-运行于 base 环境；SAM2 子进程走 grape_seg 环境。"""
+"""SAM2 全链路端到端测试：mock VL API（返回 bbox）→ 真实 SAM2 分割 → 四格式导出验证。
+运行于 base 环境；SAM2 环境通过 ANNOTATOR_SAM_PYTHON 指定，缺省自动探测。"""
 import os
 import sys
 import threading
@@ -72,7 +72,9 @@ w.refresh_models()
 # 切到实例分割 + SAM2
 w.mode_combo.setCurrentIndex(1)  # 实例分割
 w.seg_engine_combo.setCurrentIndex(1)  # 本地 SAM2
-w.sam_python_edit.setText(r"D:\Anaconda\envs\grape_seg\python.exe")
+_sam_py = os.environ.get("ANNOTATOR_SAM_PYTHON") or main.find_sam2_python()
+assert _sam_py, "未找到 SAM2 环境（可设置 ANNOTATOR_SAM_PYTHON 环境变量）"
+w.sam_python_edit.setText(_sam_py)
 w.on_mode_changed(None)
 assert w.seg_engine_combo.isEnabled() and w.sam_python_edit.isEnabled(), "控件联动失败"
 

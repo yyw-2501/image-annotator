@@ -18,10 +18,12 @@
 """
 import argparse
 import json
+import os
 import sys
 import time
 
-CKPT_DEFAULT = r"D:\葡萄\物体识别标注\checkpoints\sam2.1_hiera_tiny.pt"
+CKPT_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "checkpoints", "sam2.1_hiera_tiny.pt")
 CONFIG_DEFAULT = "configs/sam2.1/sam2.1_hiera_t.yaml"
 
 
