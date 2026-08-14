@@ -1,0 +1,8 @@
+# 统一换行符：批处理需 CRLF（cmd 要求），源码与文档用 LF
+*.bat text eol=crlf
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
