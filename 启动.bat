@@ -1,21 +1,21 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul
 cd /d "%~dp0"
 
 where python >nul 2>nul
 if errorlevel 1 (
-    echo [é”™è¯¯] æœªæ£€æµ‹åˆ° Pythonï¼Œè¯·å…ˆå®‰è£… Python 3.10+ å¹¶å‹¾é€‰ "Add to PATH"ã€‚
-    echo å®‰è£…åè¿è¡Œï¼špip install -r requirements.txt
+    echo [´íÎó] Î´¼ì²âµ½ Python£¬ÇëÏÈ°²×° Python 3.10+ ²¢¹´Ñ¡ "Add to PATH"¡£
+    echo °²×°ºóÔËĞĞ£ºpip install -r requirements.txt
     pause
     exit /b 1
 )
 
 python -c "import PySide6" >nul 2>nul
 if errorlevel 1 (
-    echo [æç¤º] ç¼ºå°‘ä¾èµ– PySide6ï¼Œæ­£åœ¨å®‰è£…ä¸»ç¯å¢ƒä¾èµ–â€¦â€¦
+    echo [ÌáÊ¾] È±ÉÙÒÀÀµ PySide6£¬ÕıÔÚ°²×°Ö÷»·¾³ÒÀÀµ...
     pip install -r requirements.txt
     if errorlevel 1 (
-        echo [é”™è¯¯] ä¾èµ–å®‰è£…å¤±è´¥ï¼Œè¯·æ‰‹åŠ¨è¿è¡Œï¼špip install -r requirements.txt
+        echo [´íÎó] ÒÀÀµ°²×°Ê§°Ü£¬ÇëÊÖ¶¯ÔËĞĞ£ºpip install -r requirements.txt
         pause
         exit /b 1
     )

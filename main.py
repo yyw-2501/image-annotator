@@ -42,15 +42,6 @@ FORMAT_LABELS = {
     "mask": "语义分割掩码 PNG（类别着色）",
 }
 
-# 常见 OpenAI 兼容服务预设地址（Base URL 下拉快捷填入）
-COMMON_BASE_URLS = [
-    ("Ollama（http://127.0.0.1:11434/v1）", "http://127.0.0.1:11434/v1"),
-    ("LM Studio（http://127.0.0.1:1234/v1）", "http://127.0.0.1:1234/v1"),
-    ("vLLM（http://127.0.0.1:8000/v1）", "http://127.0.0.1:8000/v1"),
-    ("阿里云百炼 DashScope", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-    ("OpenAI", "https://api.openai.com/v1"),
-]
-
 
 class ImageListWidget(QListWidget):
     """支持多选图片 / 文件夹拖拽的列表。"""
@@ -465,17 +456,9 @@ class MainWindow(QMainWindow):
         ml = QVBoxLayout(model_box)
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Base URL:"))
-        self.base_url_edit = QLineEdit("http://127.0.0.1:11434/v1")
+        self.base_url_edit = QLineEdit()
         self.base_url_edit.setPlaceholderText("http://127.0.0.1:11434/v1")
         row1.addWidget(self.base_url_edit, 1)
-        self.preset_combo = QComboBox()
-        self.preset_combo.addItem("预设服务…", None)
-        for _label, _url in COMMON_BASE_URLS:
-            self.preset_combo.addItem(_label, _url)
-        self.preset_combo.setCurrentIndex(0)
-        self.preset_combo.setToolTip("一键填入常见 OpenAI 兼容服务地址")
-        self.preset_combo.currentIndexChanged.connect(self._apply_preset)
-        row1.addWidget(self.preset_combo)
         self.refresh_btn = QPushButton("刷新")
         self.refresh_btn.clicked.connect(self.refresh_models)
         row1.addWidget(self.refresh_btn)
@@ -713,14 +696,6 @@ class MainWindow(QMainWindow):
         self.seg_engine_combo.setEnabled(seg_mode)
         self.sam_python_edit.setEnabled(seg_mode and self.seg_engine_combo.currentData() == "sam2")
 
-    def _apply_preset(self, idx):
-        url = self.preset_combo.itemData(idx)
-        if not url:
-            return
-        self.base_url_edit.setText(url)
-        self.log("已填入预设服务地址：%s" % url)
-        self.preset_combo.setCurrentIndex(0)
-
     def pick_sam_python(self):
         start = os.path.expanduser("~")
         cur = self.sam_python_edit.text().strip()
@@ -758,12 +733,15 @@ class MainWindow(QMainWindow):
 
     def api_config(self):
         return {
-            "base_url": self.base_url_edit.text().strip() or "http://127.0.0.1:1234/v1",
+            "base_url": self.base_url_edit.text().strip(),
             "api_key": self.api_key_edit.text().strip(),
         }
 
     def refresh_models(self):
         api = self.api_config()
+        if not api["base_url"]:
+            QMessageBox.warning(self, "提示", "请先填写 Base URL（如 http://127.0.0.1:11434/v1）。")
+            return
         try:
             models = list_vision_models(api)
         except ApiError as e:
@@ -800,6 +778,9 @@ class MainWindow(QMainWindow):
                   for i in range(self.image_list.count())]
         if not images:
             QMessageBox.information(self, "提示", "请先拖入图片。")
+            return
+        if not self.base_url_edit.text().strip():
+            QMessageBox.warning(self, "提示", "请先填写 Base URL（如 http://127.0.0.1:11434/v1）。")
             return
         model_name = self.current_model_name()
         if not model_name:
